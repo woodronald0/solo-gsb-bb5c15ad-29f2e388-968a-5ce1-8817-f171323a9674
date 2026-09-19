@@ -21,6 +21,7 @@ const state = {
   cards: [],
   groups: [],      // 主持人：全部参与组；参与者：仅本组
   groupId: null,   // 参与者本组 id（主持人为 null）
+  receipts: [],    // {card_id, group_id, created_at_ms}，已按本端视野过滤
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -159,6 +160,63 @@ function sortedCards() {
   return [...state.cards].sort((a, b) => a.trigger_seconds - b.trigger_seconds || a.seq - b.seq);
 }
 
+/* ---------------------------------------------------------- 回执 */
+
+function receiptOf(cardId, groupId) {
+  return state.receipts.find((r) => r.card_id === cardId && r.group_id === groupId) || null;
+}
+
+/* 全员卡片统计所有参与组；定向卡片只统计目标组（无参与组时无可统计对象） */
+function receiptTargetGroups(card) {
+  return card.group_id == null ? state.groups : state.groups.filter((g) => g.id === card.group_id);
+}
+
+function pruneReceipts() {
+  const cardIds = new Set(state.cards.map((c) => c.id));
+  const groupIds = new Set(state.groups.map((g) => g.id));
+  state.receipts = state.receipts.filter(
+    (r) => cardIds.has(r.card_id) && (state.role === 'host' || groupIds.has(r.group_id)),
+  );
+}
+
+/* 主持人视角：每张已揭示卡片一行按组的回执/未回执汇总 */
+function renderHostReceipts(card, li) {
+  const targets = receiptTargetGroups(card);
+  if (targets.length === 0) return;
+  const done = targets.filter((g) => receiptOf(card.id, g.id));
+  const wrap = document.createElement('div');
+  wrap.className = 'receipts';
+  const head = document.createElement('span');
+  head.className = 'receipts-head' + (done.length === targets.length ? ' all' : '');
+  head.textContent = `回执 ${done.length}/${targets.length}`;
+  wrap.appendChild(head);
+  for (const g of targets) {
+    const chip = document.createElement('span');
+    const has = !!receiptOf(card.id, g.id);
+    chip.className = 'receipt-tag ' + (has ? 'tag-done' : 'tag-miss');
+    chip.textContent = `${has ? '✓' : '○'} ${g.name}`;
+    chip.title = has ? `${g.name} 已收到` : `${g.name} 尚未回执`;
+    wrap.appendChild(chip);
+  }
+  li.appendChild(wrap);
+}
+
+/* 参与者视角：本组可见的已揭示卡片上切换“已收到 / 撤销” */
+function renderPlayerReceipt(card, li) {
+  const has = !!receiptOf(card.id, state.groupId);
+  const btn = document.createElement('button');
+  btn.className = 'receipt-btn ' + (has ? 'is-done' : '');
+  btn.textContent = has ? '✓ 已收到（点击撤销）' : '标记为已收到';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      if (has) await api('DELETE', `/api/join/${state.code}/cards/${card.id}/receipt`);
+      else await api('POST', `/api/join/${state.code}/cards/${card.id}/receipt`);
+    } catch (err) { showError(err); }
+  };
+  li.appendChild(btn);
+}
+
 function renderCards() {
   const list = $('#card-list');
   list.innerHTML = '';
@@ -215,6 +273,11 @@ function renderCards() {
       content.textContent = card.content;
       li.appendChild(content);
     }
+    // 未揭示卡片不可回执：参与者本就看不到未揭示卡片，主持人列表也不展示回执区
+    if (card.revealed) {
+      if (state.role === 'host') renderHostReceipts(card, li);
+      else renderPlayerReceipt(card, li);
+    }
     list.appendChild(li);
   }
 }
@@ -244,9 +307,11 @@ function applySnapshot(msg) {
   state.roomName = msg.room.name;
   state.cards = msg.cards;
   state.groups = msg.groups || [];
+  state.receipts = msg.receipts || [];  // 服务端已按视野过滤
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
+  pruneReceipts();
   renderAll();
 }
 
@@ -260,6 +325,7 @@ function applyEvent(msg) {
       break;
     case 'card_removed':
       state.cards = state.cards.filter((c) => c.id !== p.id);
+      state.receipts = state.receipts.filter((r) => r.card_id !== p.id);
       break;
     case 'card_revealed': {
       const card = state.cards.find((c) => c.id === p.id);
@@ -267,6 +333,17 @@ function applyEvent(msg) {
       else state.cards.push(p);
       break;
     }
+    case 'receipt_added':
+      // 同组同卡仅一次：以 (card_id, group_id) 去重，断线重连的补达事件也不会重复
+      if (!receiptOf(p.card_id, p.group_id)) {
+        state.receipts.push({ card_id: p.card_id, group_id: p.group_id, created_at_ms: p.created_at_ms });
+      }
+      break;
+    case 'receipt_revoked':
+      state.receipts = state.receipts.filter(
+        (r) => !(r.card_id === p.card_id && r.group_id === p.group_id),
+      );
+      break;
     case 'group_added':
       if (!state.groups.some((g) => g.id === p.id)) state.groups.push(p);
       break;
@@ -277,12 +354,14 @@ function applyEvent(msg) {
     }
     case 'group_removed':
       state.groups = state.groups.filter((g) => g.id !== p.id);
+      state.receipts = state.receipts.filter((r) => r.group_id !== p.id);
       break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
     case 'reset':
       state.cards.forEach((c) => { c.revealed = false; c.revealed_at_ms = null; });
+      state.receipts = [];  // 服务端已同步清空
       syncClock('idle', 0);
       break;
   }
@@ -348,6 +427,7 @@ function enterRoom(code, role) {
   state.lastEventId = 0;
   state.cards = [];
   state.groups = [];
+  state.receipts = [];
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);

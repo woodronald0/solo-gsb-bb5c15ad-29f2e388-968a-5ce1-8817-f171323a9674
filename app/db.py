@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS cards (
     UNIQUE (room_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS receipts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id       INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    created_at_ms INTEGER NOT NULL,                  -- 标记“已收到”的墙钟毫秒
+    UNIQUE (card_id, group_id)                       -- 同一参与组每张卡片仅保留一次回执
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,     -- 全局单调递增事件 ID
     room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -58,6 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_sec
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_receipts_card ON receipts(card_id);
 """
 
 
