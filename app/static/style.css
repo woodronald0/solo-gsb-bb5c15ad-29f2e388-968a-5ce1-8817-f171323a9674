@@ -172,3 +172,36 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 
 .badge-all    { background: rgba(77, 163, 255, .15); color: var(--accent); }
 .badge-target { background: rgba(245, 185, 66, .15); color: var(--amber); }
+
+/* 卡片回执 */
+.receipt-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 8px;
+}
+.receipt-btn.acked {
+  background: rgba(62, 207, 142, .15);
+  border-color: var(--green);
+  color: var(--green);
+}
+.receipt-btn:disabled { opacity: .5; }
+
+.receipt-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+.receipt-count { color: var(--muted); font-weight: 700; margin-right: 4px; }
+.receipt-count.done { color: var(--green); }
+.receipt-chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+.receipt-ok   { background: rgba(62, 207, 142, .15); color: var(--green); }
+.receipt-wait { background: rgba(139, 150, 173, .15); color: var(--muted); }

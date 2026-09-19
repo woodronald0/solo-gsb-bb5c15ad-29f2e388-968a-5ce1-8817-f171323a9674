@@ -4,6 +4,8 @@
 - 房间 / 参与组 / 注入卡片的 REST 管理
 - 可暂停 / 继续的虚拟时钟（暂停期间绝不推进）
 - 后台 tick：按 (trigger_seconds, seq) 稳定次序揭示到期卡片
+- 卡片回执：参与者对已揭示的本组可见卡片标记/撤销「已收到」，
+  同一参与组仅保留一条回执；主持人实时看到每组回执/未回执汇总
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -133,7 +135,11 @@ def resolve_code(code: str) -> tuple[sqlite3.Row | None, int | None]:
 
 
 def build_snapshot(room: sqlite3.Row, scope: int | None) -> dict:
-    """权威全量状态，按视野过滤：主持人拿全部；参与者只拿全员卡片与本组卡片。"""
+    """权威全量状态，按视野过滤：主持人拿全部；参与者只拿全员卡片与本组卡片。
+
+    回执数据同样按视野下发：主持人拿到每张卡的 expected/acked 汇总，
+    参与者只拿到本组是否已回执（my_receipt），看不到他组的回执情况。
+    """
     if scope is None:
         cards = db.execute(
             "SELECT * FROM cards WHERE room_id = ? ORDER BY trigger_seconds, seq",
@@ -160,8 +166,46 @@ def build_snapshot(room: sqlite3.Row, scope: int | None) -> dict:
         "scope": {"role": "host" if scope is None else "player", "group_id": scope},
         "room": room_public(room, include_code=scope is None),
         "groups": [group_public(g) for g in groups],
-        "cards": [card_public(c) for c in cards],
+        "cards": snapshot_cards(room, cards, groups, scope),
     }
+
+
+def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
+                   groups: list[sqlite3.Row], scope: int | None) -> list[dict]:
+    """为快照中的卡片附加回执视图（按视野分别计算）。"""
+    if scope is None:
+        # 主持人：每张卡 expected = 全员卡取全部参与组 / 定向卡取目标组；acked = 已回执组
+        acked_map: dict[int, set[int]] = {}
+        for row in db.execute(
+            "SELECT card_id, group_id FROM receipts WHERE room_id = ?", (room["id"],)
+        ):
+            acked_map.setdefault(row["card_id"], set()).add(row["group_id"])
+        group_ids = [g["id"] for g in groups]
+        out = []
+        for card in cards:
+            data = card_public(card)
+            expected = group_ids if card["group_id"] is None else [card["group_id"]]
+            acked = acked_map.get(card["id"], set())
+            data["receipts"] = {
+                "expected": expected,
+                "acked": [gid for gid in expected if gid in acked],
+            }
+            out.append(data)
+        return out
+    # 参与者：仅本组是否已回执
+    mine = {
+        row["card_id"]
+        for row in db.execute(
+            "SELECT card_id FROM receipts WHERE room_id = ? AND group_id = ?",
+            (room["id"], scope),
+        )
+    }
+    out = []
+    for card in cards:
+        data = card_public(card)
+        data["my_receipt"] = card["id"] in mine
+        out.append(data)
+    return out
 
 
 # ---------------------------------------------------------------- 广播
@@ -173,6 +217,8 @@ def event_visible(scope: int | None, type_: str, payload: dict) -> bool:
     if type_ in ("card_added", "card_revealed", "card_removed"):
         gid = payload.get("group_id")
         return gid is None or gid == scope
+    if type_ == "receipt_updated":
+        return payload.get("group_id") == scope  # 参与者只感知本组的回执变化
     if type_ == "group_renamed":
         return payload.get("id") == scope  # 参与者只需感知本组改名
     if type_ in ("group_added", "group_removed"):
@@ -433,6 +479,70 @@ async def delete_card(code: str, card_id: int):
         return {"ok": True}
 
 
+# ---------------------------------------------------------------- REST：回执
+
+def resolve_receipt_target(join_code: str, card_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """把参与者回执请求解析为 (参与组, 卡片)。
+
+    参与者凭组加入码操作，且只能操作本组可见的卡片（全员卡或目标为本组的卡）；
+    不可见的卡片一律 404，不向参与者暴露其存在。
+    """
+    group = db.execute(
+        "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+    ).fetchone()
+    if group is None:
+        raise HTTPException(status_code=404, detail="join code not found")
+    card = db.execute(
+        """SELECT * FROM cards
+           WHERE id = ? AND room_id = ? AND (group_id IS NULL OR group_id = ?)""",
+        (card_id, group["room_id"], group["id"]),
+    ).fetchone()
+    if card is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    return group, card
+
+
+@app.post("/api/join/{join_code}/cards/{card_id}/receipt")
+async def ack_card(join_code: str, card_id: int):
+    """参与者标记「已收到」。幂等：同一参与组对同一卡片仅保留一条回执。"""
+    async with state_lock:
+        group, card = resolve_receipt_target(join_code, card_id)
+        if not card["revealed"]:
+            raise HTTPException(status_code=409, detail="card not revealed yet")
+        existing = db.execute(
+            "SELECT 1 FROM receipts WHERE card_id = ? AND group_id = ?",
+            (card_id, group["id"]),
+        ).fetchone()
+        if existing is None:
+            db.execute(
+                "INSERT INTO receipts (room_id, card_id, group_id, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (group["room_id"], card_id, group["id"], time.time()),
+            )
+            db.commit()
+            room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+            await publish(room["code"], room["id"], "receipt_updated",
+                          {"card_id": card_id, "group_id": group["id"], "acked": True})
+        return {"card_id": card_id, "group_id": group["id"], "acked": True}
+
+
+@app.delete("/api/join/{join_code}/cards/{card_id}/receipt")
+async def unack_card(join_code: str, card_id: int):
+    """参与者撤销回执。幂等：本就没有回执时直接返回当前状态。"""
+    async with state_lock:
+        group, card = resolve_receipt_target(join_code, card_id)
+        cur = db.execute(
+            "DELETE FROM receipts WHERE card_id = ? AND group_id = ?",
+            (card_id, group["id"]),
+        )
+        db.commit()
+        if cur.rowcount:
+            room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+            await publish(room["code"], room["id"], "receipt_updated",
+                          {"card_id": card_id, "group_id": group["id"], "acked": False})
+        return {"card_id": card_id, "group_id": group["id"], "acked": False}
+
+
 # ---------------------------------------------------------------- REST：时钟控制
 
 async def _clock_action(code: str, expect: tuple[str, ...], action: str, sql: str, params: tuple):
@@ -485,7 +595,10 @@ async def resume_room(code: str):
 
 @app.post("/api/rooms/{code}/reset")
 async def reset_room(code: str):
-    """归零时钟并收回已揭示卡片；参与组、加入码与卡片目标全部保留。"""
+    """归零时钟并收回已揭示卡片；参与组、加入码与卡片目标全部保留。
+
+    回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计。
+    """
     async with state_lock:
         room = get_room_or_404(code)
         if room["status"] == "running":
@@ -495,6 +608,7 @@ async def reset_room(code: str):
             (room["id"],),
         )
         db.execute("UPDATE cards SET revealed = 0, revealed_at_ms = NULL WHERE room_id = ?", (room["id"],))
+        db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)

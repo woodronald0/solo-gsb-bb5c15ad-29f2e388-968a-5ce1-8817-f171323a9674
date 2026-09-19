@@ -54,10 +54,21 @@ CREATE TABLE IF NOT EXISTS events (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS receipts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一条回执
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
 """
 
 

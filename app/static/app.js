@@ -194,6 +194,9 @@ function renderCards() {
     } else {
       right.innerHTML = '<span class="badge badge-pending">待触发</span>';
     }
+    if (state.role === 'player' && card.revealed) {
+      right.appendChild(receiptButton(card));
+    }
     if (state.role === 'host' && state.status !== 'running') {
       const del = document.createElement('button');
       del.className = 'card-del';
@@ -215,8 +218,55 @@ function renderCards() {
       content.textContent = card.content;
       li.appendChild(content);
     }
+    if (state.role === 'host' && card.revealed) {
+      const summary = receiptSummary(card);
+      if (summary) li.appendChild(summary);
+    }
     list.appendChild(li);
   }
+}
+
+/* 参与者：已揭示卡片上的「已收到」开关（可撤销） */
+function receiptButton(card) {
+  const btn = document.createElement('button');
+  btn.className = 'receipt-btn' + (card.my_receipt ? ' acked' : '');
+  btn.textContent = card.my_receipt ? '✓ 已收到（点击撤销）' : '标记已收到';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const res = await api(card.my_receipt ? 'DELETE' : 'POST',
+        `/api/join/${state.code}/cards/${card.id}/receipt`);
+      card.my_receipt = res.acked; // 同组其他连接会通过 receipt_updated 事件同步
+      renderCards();
+    } catch (err) {
+      showError(err);
+      btn.disabled = false;
+    }
+  };
+  return btn;
+}
+
+/* 主持人：已揭示卡片的每组回执/未回执汇总（全员卡统计所有组，定向卡只统计目标组） */
+function receiptSummary(card) {
+  const r = card.receipts;
+  if (!r || r.expected.length === 0) return null; // 房间内还没有参与组
+  const box = document.createElement('div');
+  box.className = 'receipt-summary';
+
+  const count = document.createElement('span');
+  const done = r.acked.length === r.expected.length;
+  count.className = 'receipt-count' + (done ? ' done' : '');
+  count.textContent = `回执 ${r.acked.length}/${r.expected.length}`;
+  box.appendChild(count);
+
+  for (const gid of r.expected) {
+    const got = r.acked.includes(gid);
+    const chip = document.createElement('span');
+    chip.className = 'receipt-chip ' + (got ? 'receipt-ok' : 'receipt-wait');
+    chip.textContent = (got ? '✓ ' : '未回执 · ') + groupName(gid);
+    box.appendChild(chip);
+  }
+  return box;
 }
 
 function renderAll() {
@@ -256,7 +306,10 @@ function applyEvent(msg) {
   const p = msg.payload;
   switch (msg.type) {
     case 'card_added':
-      if (!state.cards.some((c) => c.id === p.id)) state.cards.push(p);
+      if (!state.cards.some((c) => c.id === p.id)) {
+        initReceiptState(p); // 新卡必然零回执（未揭示不可回执）
+        state.cards.push(p);
+      }
       break;
     case 'card_removed':
       state.cards = state.cards.filter((c) => c.id !== p.id);
@@ -264,11 +317,30 @@ function applyEvent(msg) {
     case 'card_revealed': {
       const card = state.cards.find((c) => c.id === p.id);
       if (card) Object.assign(card, p);
-      else state.cards.push(p);
+      else { initReceiptState(p); state.cards.push(p); }
+      break;
+    }
+    case 'receipt_updated': {
+      // 服务端已按视野过滤：主持人收全部，参与者只收本组
+      const card = state.cards.find((c) => c.id === p.card_id);
+      if (!card) break;
+      if (state.role === 'host' && card.receipts) {
+        const i = card.receipts.acked.indexOf(p.group_id);
+        if (p.acked && i < 0) card.receipts.acked.push(p.group_id);
+        if (!p.acked && i >= 0) card.receipts.acked.splice(i, 1);
+      } else if (state.role === 'player' && p.group_id === state.groupId) {
+        card.my_receipt = p.acked;
+      }
       break;
     }
     case 'group_added':
       if (!state.groups.some((g) => g.id === p.id)) state.groups.push(p);
+      // 新组自动成为所有全员卡片的待回执方
+      state.cards.forEach((c) => {
+        if (c.group_id == null && c.receipts && !c.receipts.expected.includes(p.id)) {
+          c.receipts.expected.push(p.id);
+        }
+      });
       break;
     case 'group_renamed': {
       const g = state.groups.find((g) => g.id === p.id);
@@ -277,16 +349,39 @@ function applyEvent(msg) {
     }
     case 'group_removed':
       state.groups = state.groups.filter((g) => g.id !== p.id);
+      state.cards.forEach((c) => {
+        if (c.receipts) {
+          c.receipts.expected = c.receipts.expected.filter((id) => id !== p.id);
+          c.receipts.acked = c.receipts.acked.filter((id) => id !== p.id);
+        }
+      });
       break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
     case 'reset':
-      state.cards.forEach((c) => { c.revealed = false; c.revealed_at_ms = null; });
+      state.cards.forEach((c) => {
+        c.revealed = false;
+        c.revealed_at_ms = null;
+        if (c.receipts) c.receipts.acked = []; // 回执随揭示一并收回
+        if ('my_receipt' in c) c.my_receipt = false;
+      });
       syncClock('idle', 0);
       break;
   }
   renderAll();
+}
+
+/* 事件流里新增的卡片不带回执字段（新卡/新揭示必然零回执），按角色补默认值 */
+function initReceiptState(card) {
+  if (state.role === 'host') {
+    card.receipts = {
+      expected: card.group_id == null ? state.groups.map((g) => g.id) : [card.group_id],
+      acked: [],
+    };
+  } else {
+    card.my_receipt = false;
+  }
 }
 
 /* ---------------------------------------------------------- WebSocket */
